@@ -16,7 +16,7 @@
 """
 Implementation of all CmdbReport API routes
 """
-import re
+import ast
 from logging import Logger, getLogger
 import json
 from typing import Any
@@ -25,6 +25,7 @@ from ast import literal_eval
 from flask import abort, request
 from werkzeug import Response
 from werkzeug.exceptions import HTTPException
+from bson import json_util
 
 from cmdb.database import MongoDBQueryBuilder
 from cmdb.manager.query_builder import BuilderParameters
@@ -58,7 +59,7 @@ LOGGER: Logger = getLogger(__name__)
 
 reports_blueprint = APIBlueprint('reports', __name__)
 
-DATETIME_PATTERN = r"datetime\.datetime\((.*?)\)"
+MAX_REPORT_QUERY_LENGTH = 100_000
 
 # --------------------------------------------------- CRUD - CREATE -------------------------------------------------- #
 
@@ -88,8 +89,9 @@ def create_cmdb_report(params: dict[str, Any], request_user: CmdbUser) -> Respon
         params['selected_fields'] = literal_eval(params['selected_fields'])
 
         report_type = reports_manager.get_one_from_other_collection(CmdbType.COLLECTION, params['type_id'])
-        params['report_query'] = {'data': str(MongoDBQueryBuilder(params['conditions'],
-                                                                  CmdbType.from_data(report_type)).build())}
+        params['report_query'] = {'data': json_util.dumps(MongoDBQueryBuilder(params['conditions'],
+                                                                              CmdbType.from_data(report_type))
+                                                                              .build())}
 
         new_report_id = reports_manager.insert_item(params)
 
@@ -223,20 +225,13 @@ def run_cmdb_report_query(public_id: int, request_user: CmdbUser):
         objects_manager: ObjectsManager = ManagerProvider.get_manager(ManagerType.OBJECTS, request_user)
 
         requested_report: dict = reports_manager.get_item(public_id, as_dict=True)
-        # LOGGER.debug(f"requested_report: {requested_report}")
+        LOGGER.debug(f"requested_report: {requested_report}")
 
         if not requested_report:
             abort(404, f"The Report with ID:{public_id} was not found!")
 
         query_str: str = requested_report['report_query']['data']
-
-        processed_query_string = re.sub(DATETIME_PATTERN,
-                                        replace_datetime,
-                                        query_str.replace("datetime.datetime", "datetime"))
-
-        safe_globals = {"datetime": datetime}
-        #pylint: disable=W0123
-        report_query = eval(processed_query_string, safe_globals)
+        report_query = parse_report_query(query_str)
 
         result = {}
 
@@ -250,13 +245,16 @@ def run_cmdb_report_query(public_id: int, request_user: CmdbUser):
             if preview_mode:
                 result = result[:2]
 
-        # LOGGER.debug(f"report result: {result}")
+        LOGGER.debug(f"report result: {result}")
         return DefaultResponse(result).make_response()
     except HTTPException as http_err:
         raise http_err
     except ReportsManagerGetError as err:
         LOGGER.error("[run_cmdb_report_query] ReportsManagerGetError: %s", err, exc_info=True)
         abort(400, f"Failed to retrieve the Report with ID: {public_id} from the database!")
+    except ValueError as err:
+        LOGGER.error("[run_cmdb_report_query] Invalid report query format: %s", err, exc_info=True)
+        abort(400, "The Report query has an invalid format!")
     except Exception as err:
         LOGGER.error("[run_cmdb_report_query] Exception: %s. Type: %s", err, type(err), exc_info=True)
         abort(500, f"An internal server error occured while running the Report with ID: {public_id}!")
@@ -297,8 +295,9 @@ def update_cmdb_report(public_id: int, params: dict, request_user: CmdbUser):
             abort(404, f"The Report with ID:{public_id} was not found!")
 
         report_type = reports_manager.get_one_from_other_collection(CmdbType.COLLECTION, params['type_id'])
-        params['report_query'] = {'data': str(MongoDBQueryBuilder(params['conditions'],
-                                                                    CmdbType.from_data(report_type)).build())}
+        params['report_query'] = {'data': json_util.dumps(MongoDBQueryBuilder(params['conditions'],
+                                                                              CmdbType.from_data(report_type))
+                                                                              .build())}
 
         reports_manager.update_item(public_id, params)
         current_report = reports_manager.get_item(public_id, as_dict=True)
@@ -360,23 +359,110 @@ def delete_cmdb_report(public_id: int, request_user: CmdbUser):
 
 # ------------------------------------------------------ HELPERS ----------------------------------------------------- #
 
-def replace_datetime(match: re.Match) -> str:
+def parse_report_query(query_data: str) -> dict[str, Any]:
     """
-    Replaces a regex match containing datetime arguments with a Python datetime object
-
-    Args:
-        match (re.Match): A regular expression match object containing 
-                          a string of datetime arguments (e.g., "2024, 11, 26, 0, 0").
-
-    Returns:
-        str: A string representation (repr) of the evaluated datetime object.
-
-    Notes:
-        - This function expects the match to contain arguments suitable for datetime().
-        - The returned value is the repr of the datetime object, 
-          which can be used in source code or serialization.
+    Safely parses stored report queries. Supports JSON (preferred) and legacy Python dict strings.
     """
-    args = match.group(1)
+    if not isinstance(query_data, str):
+        raise ValueError("Report query data must be a string!")
 
-    #pylint: disable=W0123
-    return repr(eval(f"datetime({args})"))
+    if len(query_data) > MAX_REPORT_QUERY_LENGTH:
+        raise ValueError("Report query data is too large!")
+
+    json_result = _parse_json_report_query(query_data)
+    if json_result is not None:
+        return json_result
+
+    return _parse_legacy_report_query(query_data)
+
+
+def _parse_json_report_query(query_data: str) -> dict[str, Any] | None:
+    """
+    Parses report queries stored as BSON Extended JSON.
+    """
+    try:
+        parsed_query = json_util.loads(query_data)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+
+    if not isinstance(parsed_query, dict):
+        raise ValueError("Report query must be a dictionary!")
+
+    return parsed_query
+
+
+def _parse_legacy_report_query(query_data: str) -> dict[str, Any]:
+    """
+    Parses legacy report queries that were stored as Python dict string representations.
+    """
+    normalized_query = query_data.replace("datetime.datetime", "datetime")
+
+    try:
+        parsed_tree = ast.parse(normalized_query, mode='eval')
+    except SyntaxError as err:
+        raise ValueError("Invalid legacy report query syntax!") from err
+
+    parsed_query = _safe_eval_query_node(parsed_tree.body)
+
+    if not isinstance(parsed_query, dict):
+        raise ValueError("Parsed report query must be a dictionary!")
+
+    return parsed_query
+
+
+def _safe_eval_query_node(node: ast.AST) -> Any:
+    """
+    Evaluates a limited and safe subset of Python AST nodes required for report query parsing.
+    """
+    if isinstance(node, ast.Constant):
+        if isinstance(node.value, (str, int, float, bool, type(None))):
+            return node.value
+        raise ValueError("Unsupported constant type in report query!")
+
+    if isinstance(node, ast.Dict):
+        return {
+            _safe_eval_query_node(key): _safe_eval_query_node(value)
+            for key, value in zip(node.keys, node.values)
+        }
+
+    if isinstance(node, ast.List):
+        return [_safe_eval_query_node(element) for element in node.elts]
+
+    if isinstance(node, ast.Tuple):
+        return tuple(_safe_eval_query_node(element) for element in node.elts)
+
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
+        operand = _safe_eval_query_node(node.operand)
+        if not isinstance(operand, (int, float)):
+            raise ValueError("Unary operations are only allowed on numbers!")
+        return operand if isinstance(node.op, ast.UAdd) else -operand
+
+    if isinstance(node, ast.Call):
+        return _parse_datetime_call(node)
+
+    raise ValueError(f"Unsupported expression in report query: {ast.dump(node)}")
+
+
+def _parse_datetime_call(node: ast.Call) -> datetime:
+    """
+    Parses datetime(...) or datetime.datetime(...) calls from legacy report query strings.
+    """
+    is_datetime_name = isinstance(node.func, ast.Name) and node.func.id == "datetime"
+    is_datetime_attribute = (
+        isinstance(node.func, ast.Attribute)
+        and isinstance(node.func.value, ast.Name)
+        and node.func.value.id == "datetime"
+        and node.func.attr == "datetime"
+    )
+
+    if not (is_datetime_name or is_datetime_attribute):
+        raise ValueError("Only datetime constructor calls are allowed in report queries!")
+
+    if node.keywords:
+        raise ValueError("Keyword arguments are not allowed in datetime constructors!")
+
+    args = [_safe_eval_query_node(arg) for arg in node.args]
+    if not args or any(not isinstance(arg, int) for arg in args):
+        raise ValueError("datetime constructor expects integer positional arguments only!")
+
+    return datetime(*args)

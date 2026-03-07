@@ -1,20 +1,3 @@
-/*
-* DATAGERRY - OpenSource Enterprise CMDB
-* Copyright (C) 2026 becon GmbH
-*
-* This program is free software: you can redistribute it and/or modify
-* it under the terms of the GNU Affero General Public License as
-* published by the Free Software Foundation, either version 3 of the
-* License, or (at your option) any later version.
-*
-* This program is distributed in the hope that it will be useful,
-* but WITHOUT ANY WARRANTY; without even the implied warranty of
-* MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
-* GNU Affero General Public License for more details.
-*
-* You should have received a copy of the GNU Affero General Public License
-* along with this program. If not, see <https://www.gnu.org/licenses/>.
-*/
 import { Injectable } from '@angular/core';
 import * as Papa from 'papaparse';
 import { saveAs } from 'file-saver';
@@ -91,10 +74,11 @@ export class FileExportService {
             const mapped: any = {};
             for (const col of columns) {
                 // Keep boolean values as booleans
-                if (typeof row[col] === 'boolean') {
-                    mapped[col] = row[col];
+                const value = row[col] ?? '';
+                if (typeof value === 'boolean') {
+                    mapped[col] = value;
                 } else {
-                    mapped[col] = row[col] ?? '';
+                    mapped[col] = this.sanitizeSpreadsheetValue(value);
                 }
             }
             return mapped;
@@ -114,5 +98,21 @@ export class FileExportService {
             });
             return renamed;
         });
+    }
+
+    /**
+     * Prevents formula injection when exported data is opened in spreadsheet applications.
+     */
+    private sanitizeSpreadsheetValue(value: any): any {
+        if (typeof value !== 'string') {
+            return value;
+        }
+
+        const normalized = value.trimStart();
+        if (/^[=+\-@]/.test(normalized)) {
+            return `'${value}`;
+        }
+
+        return value;
     }
 }

@@ -10,7 +10,7 @@
 <mat-menu #externalLinksMenu="matMenu">
   <ng-container *ngIf="renderResult?.externals.length > 0; else noLinks">
     <div class="overflow-auto" style="max-height:20vh">
-      <a mat-menu-item *ngFor="let ext of renderResult?.externals" [href]="getSantizeUrl(ext.href)" target="_blank">
+      <a mat-menu-item *ngFor="let ext of renderResult?.externals" [href]="getSanitizedUrl(ext.href)" target="_blank">
         <i [class]="ext.icon" class="mr-2"></i>
         <span>{{ ext.label }}</span>
       </a>
@@ -20,5 +20,4 @@
     <button mat-menu-item disabled>No external links available.</button>
   </ng-template>
 </mat-menu>
-
 

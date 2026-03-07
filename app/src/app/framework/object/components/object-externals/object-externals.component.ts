@@ -18,7 +18,6 @@
 
 import { Component, Input } from '@angular/core';
 import { RenderResult } from '../../../models/cmdb-render';
-import { DomSanitizer } from '@angular/platform-browser';
 
 @Component({
     selector: 'cmdb-object-externals',
@@ -29,9 +28,22 @@ import { DomSanitizer } from '@angular/platform-browser';
 export class ObjectExternalsComponent {
 
   @Input() renderResult: RenderResult = undefined;
-  constructor(private sanitizer: DomSanitizer) {}
+  private static readonly SAFE_PROTOCOLS = new Set(['http:', 'https:', 'mailto:', 'tel:']);
 
-  getSantizeUrl(url: string) {
-    return this.sanitizer.bypassSecurityTrustUrl(url);
+  getSanitizedUrl(url: string): string {
+    if (typeof url !== 'string' || !url.trim()) {
+      return 'about:blank';
+    }
+
+    try {
+      const parsedUrl = new URL(url, 'http://localhost');
+      if (ObjectExternalsComponent.SAFE_PROTOCOLS.has(parsedUrl.protocol)) {
+        return url;
+      }
+    } catch {
+      return 'about:blank';
+    }
+
+    return 'about:blank';
   }
 }
